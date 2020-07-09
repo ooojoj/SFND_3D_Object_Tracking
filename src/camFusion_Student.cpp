@@ -122,6 +122,7 @@ void show3DObjects(std::vector<BoundingBox> &boundingBoxes, cv::Size worldSize, 
     string windowName = "3D Objects";
     cv::namedWindow(windowName, 1);
     cv::imshow(windowName, topviewImg);
+    //cv::imwrite("topview.png",topviewImg); 
 
     if(bWait)
     {
@@ -133,7 +134,13 @@ void show3DObjects(std::vector<BoundingBox> &boundingBoxes, cv::Size worldSize, 
 // associate a given bounding box with the keypoints it contains
 void clusterKptMatchesWithROI(BoundingBox &boundingBox, std::vector<cv::KeyPoint> &kptsPrev, std::vector<cv::KeyPoint> &kptsCurr, std::vector<cv::DMatch> &kptMatches)
 {
-    // ...
+    // Loop over all matches in the current frame
+    for (auto match : kptMatches) 
+    {
+        if (boundingBox.roi.contains(kptsCurr[match.trainIdx].pt)) {
+            boundingBox.kptMatches.push_back(match);
+        }
+    }
 }
 
 
@@ -141,18 +148,199 @@ void clusterKptMatchesWithROI(BoundingBox &boundingBox, std::vector<cv::KeyPoint
 void computeTTCCamera(std::vector<cv::KeyPoint> &kptsPrev, std::vector<cv::KeyPoint> &kptsCurr, 
                       std::vector<cv::DMatch> kptMatches, double frameRate, double &TTC, cv::Mat *visImg)
 {
-    // ...
-}
+    // compute distance ratios between all matched keypoints
+    vector<double> distRatios; // stores the distance ratios for all keypoints between curr. and prev. frame
+    for (auto it1 = kptMatches.begin(); it1 != kptMatches.end() - 1; ++it1)
+    { // outer kpt. loop
 
+        // get current keypoint and its matched partner in the prev. frame
+        cv::KeyPoint kpOuterCurr = kptsCurr.at(it1->trainIdx);
+        cv::KeyPoint kpOuterPrev = kptsPrev.at(it1->queryIdx);
+
+        for (auto it2 = kptMatches.begin() + 1; it2 != kptMatches.end(); ++it2)
+        { // inner kpt.-loop
+
+            double minDist = 100.0; // min. required distance
+
+            // get next keypoint and its matched partner in the prev. frame
+            cv::KeyPoint kpInnerCurr = kptsCurr.at(it2->trainIdx);
+            cv::KeyPoint kpInnerPrev = kptsPrev.at(it2->queryIdx);
+
+            // compute distances and distance ratios
+            double distCurr = cv::norm(kpOuterCurr.pt - kpInnerCurr.pt);
+            double distPrev = cv::norm(kpOuterPrev.pt - kpInnerPrev.pt);
+
+            if (distPrev > std::numeric_limits<double>::epsilon() && distCurr >= minDist)
+            { // avoid division by zero
+
+                double distRatio = distCurr / distPrev;
+                distRatios.push_back(distRatio);
+            }
+        } // eof inner loop over all matched kpts
+    }     // eof outer loop over all matched kpts
+
+    // only continue if list of distance ratios is not empty
+    if (distRatios.size() == 0)
+    {
+        TTC = NAN;
+        return;
+    }
+
+    std::sort(distRatios.begin(), distRatios.end());
+    long medIndex = floor(distRatios.size() / 2.0);
+    double medDistRatio = distRatios.size() % 2 == 0 ? (distRatios[medIndex - 1] + distRatios[medIndex]) / 2.0 : distRatios[medIndex]; // compute median dist. ratio to remove outlier influence
+
+    double dT = 1 / frameRate;
+    TTC = -dT / (1 - medDistRatio);
+}
 
 void computeTTCLidar(std::vector<LidarPoint> &lidarPointsPrev,
                      std::vector<LidarPoint> &lidarPointsCurr, double frameRate, double &TTC)
 {
-    // ...
+    
+    double dT=1/frameRate;
+    
+    //find average
+    double avgPrev = std::accumulate(lidarPointsPrev.begin(), lidarPointsPrev.end(), 0.0,
+             [](double sum, const LidarPoint& i) { return sum + i.x ;}) /lidarPointsPrev.size();
+    double avgCurr = std::accumulate(lidarPointsCurr.begin(), lidarPointsCurr.end(), 0.0,
+             [](double sum, const LidarPoint& i) { return sum + i.x ;}) /lidarPointsCurr.size();
+    
+    //calculate standard deviation
+    double accum = 0.0;
+    std::for_each (std::begin(lidarPointsPrev), std::end(lidarPointsPrev), [&](const LidarPoint d) 
+    {
+        accum += (d.x - avgPrev) * (d.x - avgPrev);
+    });
+    double pstdev = sqrt(accum / (lidarPointsPrev.size()-1));
+
+    accum = 0.0;
+    std::for_each (std::begin(lidarPointsCurr), std::end(lidarPointsCurr), [&](const LidarPoint d) 
+    {
+        accum += (d.x - avgCurr) * (d.x - avgCurr);
+    });
+    double cstdev = sqrt(accum / (lidarPointsCurr.size()-1));
+
+    //remove outliers. keep only points in the band mean +- 2 * standard deviation
+    //cout<< "LidarPointsPrev.size:" << lidarPointsPrev.size() << ", LidarPointsCurr.size:" << lidarPointsCurr.size()<<endl;
+    lidarPointsPrev.erase(std::remove_if(lidarPointsPrev.begin(),lidarPointsPrev.end(),[&](LidarPoint i){return i.x<(avgPrev-2*pstdev) || i.x>(avgPrev+2*pstdev)  ;}), lidarPointsPrev.end());
+    lidarPointsCurr.erase(std::remove_if(lidarPointsCurr.begin(),lidarPointsCurr.end(),[&](LidarPoint i){return i.x<(avgCurr-2*cstdev) || i.x>(avgCurr+2*cstdev)  ;}), lidarPointsCurr.end());
+    //cout<< "LidarPointsPrev.size:" << lidarPointsPrev.size() << ", LidarPointsCurr.size:" << lidarPointsCurr.size()<<endl;
+
+    // double avgPrev2 = std::accumulate(lidarPointsPrev.begin(), lidarPointsPrev.end(), 0.0,
+    //           [](double sum, const LidarPoint& i) { return sum + i.x ;}) /lidarPointsPrev.size();
+
+    // double avgCurr2 = std::accumulate(lidarPointsCurr.begin(), lidarPointsCurr.end(), 0.0,
+    //           [](double sum, const LidarPoint& i) { return sum + i.x ;}) /lidarPointsCurr.size();
+
+    //Classroom solution
+     double laneWidth = 4.0; // assumed width of the ego lane
+    // find closest distance to Lidar points within ego lane
+    double minXPrev = 1e9, minXCurr = 1e9;    
+    for (auto it = lidarPointsPrev.begin(); it != lidarPointsPrev.end(); ++it)
+    {
+        
+        if (abs(it->y) <= laneWidth / 2.0)
+        { // 3D point within ego lane?
+            minXPrev = minXPrev > it->x ? it->x : minXPrev;
+        }
+    }
+
+    for (auto it = lidarPointsCurr.begin(); it != lidarPointsCurr.end(); ++it)
+    {
+
+        if (abs(it->y) <= laneWidth / 2.0)
+        { // 3D point within ego lane?
+            minXCurr = minXCurr > it->x ? it->x : minXCurr;
+        }
+    }
+    
+    // compute TTC from both measurements
+    TTC = minXCurr * dT / (minXPrev - minXCurr);
+    //TTC = avgCurr * dT / (avgPrev - avgCurr); //take only average 
+    //TTC = avgCurr2 * dT / (avgPrev2 - avgCurr2); //take only average   
+   
 }
 
 
 void matchBoundingBoxes(std::vector<cv::DMatch> &matches, std::map<int, int> &bbBestMatches, DataFrame &prevFrame, DataFrame &currFrame)
 {
-    // ...
+    
+    std::map<int, int> bbMatches; 
+    std::map<std::pair<int,int>,int> bbCorrelations;
+  
+    
+
+    for (auto match : matches)
+    {
+        //get keypoints from the last and current frame based on https://stackoverflow.com/questions/13318853/opencv-drawmatches-queryidx-and-trainidx
+        cv::KeyPoint pKeypoint = prevFrame.keypoints[match.queryIdx];
+        int pBoxId = -1;
+
+        //scan for each bbox in the previous frame
+        for(auto bb : prevFrame.boundingBoxes)
+        {
+            if (bb.roi.contains(pKeypoint.pt))
+            {
+               pBoxId=bb.boxID;               
+               break;    
+            }
+        }
+        
+
+        cv::KeyPoint cKeypoint = currFrame.keypoints[match.trainIdx];
+        int cBoxId = -1;
+
+        //scan for each bbox in the current frame
+        for(auto bb : currFrame.boundingBoxes)
+        {
+            if (bb.roi.contains(cKeypoint.pt))
+            {
+               cBoxId=bb.boxID;     
+               break;
+            }
+        }         
+
+
+    //determine the number of relations between bounding boxes   
+    if(pBoxId != -1 && cBoxId != -1) //dismiss not related
+        {
+            //Searches the container for an element with a key equivalent to k and returns an iterator to it if found, 
+            //otherwise it returns an iterator to map::end.
+            auto found = bbCorrelations.find({pBoxId,cBoxId});
+
+            if (found != bbCorrelations.end()) {(found->second)++;}
+            else { bbCorrelations[{pBoxId,cBoxId}]=1; }            
+        }
+    }    
+    
+
+    //scan bounding box correlations for the highest occurence
+    for (auto itr = bbCorrelations.begin(); itr != bbCorrelations.end(); ++itr) 
+    { 
+        
+        if (bbBestMatches.find((itr->first).first) == bbBestMatches.end())
+        {
+            
+            int count = itr->second;// get number of correlations
+            
+            int boxId1 =  (itr->first).first;
+            int boxId2 = (itr->first).second;            
+                        
+            //find bounding box with the highest number of correlations
+            for (auto itr2=itr; itr2 != bbCorrelations.end() ; ++itr2)
+            {
+                if ((itr2->first).first == boxId1)
+                {
+                    if (itr2->second > count)
+                    {
+                        boxId2 = (itr2->first).second;
+                        count = itr2->second;
+                    }
+                }       
+            }
+            bbBestMatches[boxId1] = boxId2;
+        }
+    } 
+
 }
